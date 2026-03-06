@@ -16,33 +16,37 @@ declare global {
 const UI_TEXT = {
   ko: {
     searchPlaceholder: "장소를 검색해보세요",
-    open: "영업 중",
-    closed: "영업 종료",
     copy: "복사",
     copyAlert: "전화번호가 복사되었습니다:",
     visitWeb: "웹사이트 방문",
-    delete: "삭제하기",
-    save: "저장하기",
+    delete: "삭제",
+    save: "저장",
+    update: "수정",
+    cancel: "취소",
     ratingCount: "명",
     addressError: "주소 정보 없음",
-    defaultName: "장소 정보"
+    defaultName: "장소 정보",
+    memoPlaceholder: "이 장소에 대한 메모를 남겨보세요...",
+    apiError: "서버 통신 중 오류가 발생했습니다."
   },
   en: {
     searchPlaceholder: "Search places...",
-    open: "Open Now",
-    closed: "Closed",
     copy: "Copy",
     copyAlert: "Phone number copied:",
     visitWeb: "Visit Website",
     delete: "Remove",
     save: "Save",
+    update: "Update",
+    cancel: "Cancel",
     ratingCount: " reviews",
     addressError: "No address info",
-    defaultName: "Place Info"
+    defaultName: "Place Info",
+    memoPlaceholder: "Write a memo for this place...",
+    apiError: "An error occurred while communicating with the server."
   }
 };
 
-const LIBRARIES = ["places", "marker"] as const;
+const GOOGLE_MAPS_LIBRARIES: ("places" | "marker")[] = ["places", "marker"];
 const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY!;
 
 // --- [1. 최신 방식 장소 변환 함수] ---
@@ -58,7 +62,6 @@ async function transformPlace(place: any) {
     modernPlace = new Place({ id: pid });
   }
 
-  // ✅ isOpen() 사용을 위해 utcOffsetMinutes 필수 포함
   await modernPlace.fetchFields({
     fields: [
       "displayName",
@@ -76,15 +79,11 @@ async function transformPlace(place: any) {
     ],
   });
 
-  console.log("🔥 [API 원본 데이터] Google Maps Place Object:", modernPlace);
-
   let openStatus = false;
   try {
-    // ✅ Beta 채널에서만 작동하는 isOpen() 함수 호출
     openStatus = await modernPlace.isOpen(new Date());
   } catch (e) {
-    console.warn("영업 상태 확인 실패 (API 버전 확인 필요):", e);
-    // isOpen 실패 시 기본값 false (혹은 여기서 수동 계산 로직을 넣을 수도 있음)
+    console.warn("영업 상태 확인 실패:", e);
     openStatus = false; 
   }
 
@@ -112,8 +111,6 @@ async function transformPlace(place: any) {
     websiteURI: modernPlace.websiteURI,
   };
 
-  console.log("✨ [가공된 데이터] UI에 표시할 객체:", result);
-
   return result;
 }
 
@@ -136,8 +133,6 @@ function AdvancedMarker({
       
       if (!markerRef.current) {
         markerRef.current = new AdvancedMarkerElement({ map, position });
-        
-        // ✅ gmp-click 이벤트 리스너 (경고 해결)
         if (onClick) {
           markerRef.current.addEventListener("gmp-click", onClick);
         }
@@ -161,15 +156,17 @@ function AdvancedMarker({
   return null;
 }
 
-const containerStyle = { width: "100%", height: "100vh" };
+const containerStyle = { width: "100%", height: "100%" };
 
 type SavedMarker = {
   id: string;
+   place_id?: string; // 👈 DB에서 넘어오는 구글 장소 ID 추가
   lat: number;
   lng: number;
   name: string;
   address?: string;
   types?: string[];
+  memo?: string; 
 };
 
 // --- [3. 메인 컴포넌트] ---
@@ -177,17 +174,18 @@ export default function Home() {
   const [langCode, setLangCode] = useState<'ko' | 'en'>('en');
   const t = UI_TEXT[langCode];
 
+  const [isLoadingApi, setIsLoadingApi] = useState(false); // API 통신 중 로딩 상태
+
   useEffect(() => {
     if (typeof window !== 'undefined' && navigator.language) {
       setLangCode(navigator.language.includes('ko') ? 'ko' : 'en');
     }
   }, []);
 
-  // ✅ [수정] 속성명을 'v' -> 'version'으로 변경해야 Beta 버전이 로드됩니다.
   const { isLoaded } = useLoadScript({
     googleMapsApiKey: GOOGLE_MAPS_API_KEY,
-    libraries: LIBRARIES as any,
-    version: "beta", // ✨ 여기가 핵심입니다!
+    libraries: GOOGLE_MAPS_LIBRARIES,
+    version: "beta", 
   });
 
   const [map, setMap] = useState<google.maps.Map | null>(null);
@@ -195,6 +193,7 @@ export default function Home() {
   const [selectedPlace, setSelectedPlace] = useState<any>(null); 
   const [showDetails, setShowDetails] = useState(false);         
   const [savedMarkers, setSavedMarkers] = useState<SavedMarker[]>([]);
+  const [memo, setMemo] = useState(""); 
   const mapRef = useRef<google.maps.Map | null>(null);
 
   const getCategoryIcon = (types?: string[]) => {
@@ -222,16 +221,36 @@ export default function Home() {
   };
 
   useEffect(() => {
+    if (selectedPlace) {
+      // 👈 m.place_id 와 m.id 모두 체크하도록 변경
+      const saved = savedMarkers.find((m) => (m.place_id || m.id) === selectedPlace.place_id);
+      setMemo(saved?.memo || "");
+    }
+  }, [selectedPlace, savedMarkers]);
+
+  // 💡 [변경] 최초 진입 시 서버(DB)에서 핀 데이터 불러오기
+  useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition((pos) => {
         setCenter({ lat: pos.coords.latitude, lng: pos.coords.longitude });
       });
     }
-    const saved = localStorage.getItem("my_saved_places");
-    if (saved) setSavedMarkers(JSON.parse(saved));
+
+    const fetchSavedPins = async () => {
+      try {
+        const response = await fetch("/api/pins");
+        if (response.ok) {
+          const data = await response.json();
+          setSavedMarkers(data);
+        }
+      } catch (error) {
+        console.error("Failed to load pins from server:", error);
+      }
+    };
+    
+    fetchSavedPins();
   }, []);
 
-  // 🔎 검색창
   useEffect(() => {
     if (!isLoaded) return;
     const initAutocomplete = async () => {
@@ -251,8 +270,6 @@ export default function Home() {
         autocomplete.addEventListener("gmp-select", async (e: any) => {
           const prediction = e.placePrediction;
           if (!prediction) return;
-          
-          console.log("🔎 [검색 선택] 검색된 장소:", prediction.placeId);
 
           const place = prediction.toPlace();
           const formatted = await transformPlace(place);
@@ -267,7 +284,7 @@ export default function Home() {
             mapRef.current?.setZoom(16);
 
             setSelectedPlace(formatted);
-            setShowDetails(false); 
+            setShowDetails(true); 
           }
         });
       }
@@ -275,14 +292,10 @@ export default function Home() {
     initAutocomplete();
   }, [isLoaded, t]);
 
-  // 🗺 지도 클릭
   const handleMapClick = useCallback(async (e: google.maps.MapMouseEvent) => {
     if (!mapRef.current) return;
     if ((e as any).placeId) {
       e.stop();
-      
-      console.log("👆 [지도 클릭] POI 클릭됨 ID:", (e as any).placeId);
-
       const { Place } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
       const place = new Place({ id: (e as any).placeId });
       const formatted = await transformPlace(place);
@@ -294,34 +307,105 @@ export default function Home() {
     }
   }, []);
 
-  const handleSavePlace = () => {
+  // 💡 서버(DB)에 핀 데이터 저장/수정 요청
+  // 💡 서버(DB)에 핀 데이터 저장/수정 요청
+  const handleSavePlace = async () => {
     if (!selectedPlace?.geometry?.location) return;
+    setIsLoadingApi(true);
+
     const loc = selectedPlace.geometry.location;
-    const newMarker: SavedMarker = {
-      id: selectedPlace.place_id,
+    
+    // 1. 기존에 저장된 핀인지 확인하여 기존 DB의 고유 UUID 확보
+    const existingMarker = savedMarkers.find((m) => (m.place_id || m.id) === selectedPlace.place_id);
+
+    // 2. 서버로 전송할 데이터 구성
+    const payload: any = {
+      place_id: selectedPlace.place_id,
       lat: typeof loc.lat === 'function' ? loc.lat() : loc.lat,
       lng: typeof loc.lng === 'function' ? loc.lng() : loc.lng,
       name: selectedPlace.name,
       address: selectedPlace.formatted_address,
       types: selectedPlace.types,
+      memo: memo,
     };
-    const updated = [...savedMarkers, newMarker];
-    setSavedMarkers(updated);
-    localStorage.setItem("my_saved_places", JSON.stringify(updated));
+
+    // ✨ 기존 핀일 경우, DB 고유 ID(UUID)를 추가해서 중복 생성을 막음
+    if (existingMarker && existingMarker.id) {
+      payload.id = existingMarker.id;
+    }
+
+    try {
+      // 🚀 핵심 수정 부분: method를 무조건 "POST"로 고정합니다!
+            const response = await fetch("/api/pins", {
+     // payload에 고유 id가 있으면 수정(PUT), 없으면 신규 저장(POST)
+  method: payload.id ? "PUT" : "POST", 
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) throw new Error("Save/Update failed");
+
+      // 응답 데이터를 바탕으로 프론트엔드 데이터 구성
+      let savedData = payload;
+      try {
+        const resData = await response.json();
+        if (resData && resData.id) savedData = resData; 
+      } catch (e) {
+        // 응답이 json이 아닐 경우 무시
+      }
+
+      // 3. 화면 UI 상태 업데이트
+      if (existingMarker) {
+        // 기존 핀 수정 시 덮어쓰기
+        const updated = savedMarkers.map((m) =>
+          (m.place_id || m.id) === selectedPlace.place_id ? { ...m, ...savedData } : m
+        );
+        setSavedMarkers(updated);
+      } else {
+        // 신규 핀 저장 시 목록에 추가
+        setSavedMarkers([...savedMarkers, savedData as SavedMarker]);
+      }
+      
+      setShowDetails(false);
+    } catch (error) {
+      alert("API 요청 중 오류가 발생했습니다.");
+      console.error(error);
+    } finally {
+      setIsLoadingApi(false);
+    }
   };
 
-  const handleDeletePlace = () => {
-    const updated = savedMarkers.filter((m) => m.id !== selectedPlace.place_id);
-    setSavedMarkers(updated);
-    localStorage.setItem("my_saved_places", JSON.stringify(updated));
-    setSelectedPlace(null);
-    setShowDetails(false);
+  // 💡 [변경] 서버(DB)에 핀 데이터 삭제 요청
+  const handleDeletePlace = async () => {
+    if (!selectedPlace) return;
+    setIsLoadingApi(true);
+
+    try {
+      const response = await fetch(`/api/pins?id=${selectedPlace.place_id}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) throw new Error("Delete failed");
+
+      const updated = savedMarkers.filter((m) => (m.place_id || m.id) !== selectedPlace.place_id);
+      setSavedMarkers(updated);
+      setSelectedPlace(null);
+      setShowDetails(false);
+    } catch (error) {
+      alert(t.apiError);
+      console.error(error);
+    } finally {
+      setIsLoadingApi(false);
+    }
   };
 
   if (!isLoaded) return <div style={{ padding: 20 }}>Loading...</div>;
 
+  const isSaved = savedMarkers.some((m) => (m.place_id || m.id) === selectedPlace?.place_id);
+
   return (
-    <div style={{ position: "relative", width: "100vw", height: "100vh", overflow: "hidden" }}>
+    <div style={{ position: "relative", width: "100%", height: "calc(100vh - 100px)", minHeight: "600px", overflow: "hidden", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" }}>
+      
       <div style={{ position: "absolute", top: 20, left: "50%", transform: "translateX(-50%)", zIndex: 10, width: "90%", maxWidth: 400 }}>
         <div id="autocomplete-container" />
       </div>
@@ -357,78 +441,109 @@ export default function Home() {
             key={marker.id}
             map={map}
             position={{ lat: marker.lat, lng: marker.lng }}
-            onClick={() => setCenter({ lat: marker.lat, lng: marker.lng })}
+            onClick={async () => {
+              // 1. 클릭한 위치로 지도 이동
+              setCenter({ lat: marker.lat, lng: marker.lng });
+              
+              // 2. 저장된 장소의 구글 데이터 불러와서 팝업 띄우기
+              const targetId = marker.place_id || marker.id;
+              if (targetId) {
+                const { Place } = (await google.maps.importLibrary("places")) as google.maps.PlacesLibrary;
+                const place = new Place({ id: targetId });
+                const formatted = await transformPlace(place);
+                setSelectedPlace(formatted);
+                setShowDetails(true);
+              }
+            }}
           />
         ))}
       </GoogleMap>
 
       {selectedPlace && showDetails && (
-        <div style={{ position: "absolute", bottom: "30px", left: "50%", transform: "translateX(-50%)", width: "90%", maxWidth: "400px", padding: "24px 20px", borderRadius: "16px", background: "white", boxShadow: "0 4px 20px rgba(0,0,0,0.15)", zIndex: 20, animation: "fadeIn 0.3s ease-out", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" }}>
+        <div style={{ position: "absolute", bottom: "30px", left: "50%", transform: "translateX(-50%)", width: "90%", maxWidth: "400px", padding: "24px 20px", borderRadius: "16px", background: "white", boxShadow: "0 4px 20px rgba(0,0,0,0.15)", zIndex: 20, animation: "fadeIn 0.3s ease-out" }}>
+          
           <button onClick={() => setShowDetails(false)} style={{ position: "absolute", top: 15, right: 15, border: "none", background: "transparent", fontSize: "20px", color: "#999", cursor: "pointer" }}>✕</button>
 
-          {selectedPlace.photoUrl && (
-            <img src={selectedPlace.photoUrl} alt="place" style={{ width: "100%", height: "160px", objectFit: "cover", borderRadius: "12px", marginBottom: "16px" }} />
-          )}
-
-          <h3 style={{ margin: "0 0 4px 0", fontSize: "19px", color: "#242424", fontWeight: 700, lineHeight: 1.4 }}>
-            {getCategoryIcon(selectedPlace.types)} {selectedPlace.name || t.defaultName}
-          </h3>
-          
-          {selectedPlace.rating && (
-            <div style={{ fontSize: "14px", color: "#555", marginBottom: "12px" }}>
-              <span style={{ color: "#f5a623" }}>★</span> 
-              <span style={{ fontWeight: 600 }}>{selectedPlace.rating}</span>
-              <span style={{ color: "#999" }}> ({selectedPlace.user_ratings_total}{t.ratingCount})</span>
-            </div>
-          )}
-
-          <hr style={{ border: "none", borderTop: "1px solid #eee", margin: "12px 0" }} />
-
-          <div style={{ display: "flex", alignItems: "flex-start", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
-            <span style={{ marginRight: "10px", color: "#70757a", marginTop: "2px" }}>📍</span>
-            <span style={{ color: "#3c4043" }}>{selectedPlace.formatted_address || t.addressError}</span>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "flex-start", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
-            <span style={{ marginRight: "10px", color: "#70757a", marginTop: "2px" }}>🕒</span>
-            <div>
-              <span style={{ fontWeight: "bold", color: selectedPlace.opening_hours.isOpen ? "#188038" : "#d93025", marginRight: "6px" }}>
-                {selectedPlace.opening_hours.isOpen ? t.open : t.closed}
-              </span>
-              <span style={{ color: "#70757a" }}>
-                 · {getTodayHours(selectedPlace.opening_hours.weekdayText)}
-              </span>
-            </div>
-          </div>
-
-          {selectedPlace.formatted_phone_number && (
-            <div style={{ display: "flex", alignItems: "center", marginBottom: "12px", fontSize: "14px", lineHeight: 1.5 }}>
-              <span style={{ marginRight: "10px", color: "#70757a" }}>📞</span>
-              <span style={{ color: "#3c4043", marginRight: "8px" }}>{selectedPlace.formatted_phone_number}</span>
-              <button onClick={() => handleCopyPhone(selectedPlace.formatted_phone_number)} style={{ border: "1px solid #dadce0", background: "white", color: "#1a73e8", borderRadius: "100px", fontSize: "12px", padding: "2px 10px", cursor: "pointer", fontWeight: 500 }}>
-                {t.copy}
-              </button>
-            </div>
-          )}
-
-           {selectedPlace.websiteURI && (
-             <div style={{ display: "flex", alignItems: "center", marginBottom: "12px", fontSize: "14px" }}>
-               <span style={{ marginRight: "10px", color: "#70757a" }}>🌐</span>
-               <a href={selectedPlace.websiteURI} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", textDecoration: "none" }}>
-                 {t.visitWeb}
-               </a>
-             </div>
-           )}
-
-          <div style={{ marginTop: "20px" }}>
-            {savedMarkers.some((m) => m.id === selectedPlace.place_id) ? (
-              <button onClick={handleDeletePlace} style={{ width: "100%", padding: "12px", backgroundColor: "#f2f2f2", color: "#d93025", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: "pointer" }}>
-                {t.delete}
-              </button>
+          <div style={{ display: "flex", gap: "16px", alignItems: "flex-start", marginBottom: "16px", paddingRight: "20px" }}>
+            {selectedPlace.photoUrl ? (
+              <img src={selectedPlace.photoUrl} alt="place" style={{ width: "80px", height: "80px", objectFit: "cover", borderRadius: "12px", flexShrink: 0, border: "1px solid #eee" }} />
             ) : (
-              <button onClick={handleSavePlace} style={{ width: "100%", padding: "12px", backgroundColor: "#1a73e8", color: "white", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: "pointer", boxShadow: "0 1px 2px rgba(60,64,67,0.3), 0 1px 3px 1px rgba(60,64,67,0.15)" }}>
-                {t.save}
-              </button>
+              <div style={{ width: "80px", height: "80px", backgroundColor: "#f2f2f2", borderRadius: "12px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "30px", flexShrink: 0 }}>
+                {getCategoryIcon(selectedPlace.types)}
+              </div>
+            )}
+            
+            <div style={{ display: "flex", flexDirection: "column", overflow: "hidden", alignItems: "flex-start", textAlign: "left" }}>
+              <h3 style={{ margin: "0 0 4px 0", fontSize: "16px", color: "#242424", fontWeight: 700, lineHeight: 1.3, wordBreak: "keep-all" }}>
+                {getCategoryIcon(selectedPlace.types)} {selectedPlace.name || t.defaultName}
+              </h3>
+              
+              {selectedPlace.rating && (
+                <div style={{ fontSize: "13px", color: "#555", display: "flex", alignItems: "center", gap: "4px", marginBottom: "6px" }}>
+                  <span style={{ color: "#f5a623" }}>★</span> 
+                  <span style={{ fontWeight: 600 }}>{selectedPlace.rating}</span>
+                  <span style={{ color: "#999" }}>({selectedPlace.user_ratings_total})</span>
+                </div>
+              )}
+
+              <div style={{ fontSize: "14px", color: "#555", lineHeight: 1.4, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>
+                📍 {selectedPlace.formatted_address || t.addressError}
+              </div>
+            </div>
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #eee", margin: "0 0 16px 0" }} />
+
+          <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", columnGap: "16px", rowGap: "8px", marginBottom: "12px", fontSize: "13px" }}>
+            
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ fontSize: "12px" }}>
+                {selectedPlace.opening_hours.isOpen ? "🟢" : "🔴"}
+              </span>
+              <span style={{ color: "#3c4043", fontWeight: 500 }}>
+                {getTodayHours(selectedPlace.opening_hours.weekdayText) || (selectedPlace.opening_hours.isOpen ? "영업 중" : "영업 종료")}
+              </span>
+            </div>
+
+            {selectedPlace.formatted_phone_number && (
+              <div style={{ display: "flex", alignItems: "center" }}>
+                <span style={{ color: "#70757a", marginRight: "6px" }}>📞</span>
+                <span style={{ color: "#3c4043", marginRight: "6px" }}>{selectedPlace.formatted_phone_number}</span>
+                <button onClick={() => handleCopyPhone(selectedPlace.formatted_phone_number)} style={{ border: "1px solid #dadce0", background: "white", color: "#1a73e8", borderRadius: "100px", fontSize: "11px", padding: "2px 8px", cursor: "pointer", fontWeight: 500 }}>
+                  {t.copy}
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginBottom: "16px" }}>
+            <textarea 
+              value={memo}
+              onChange={(e) => setMemo(e.target.value)}
+              placeholder={t.memoPlaceholder}
+              style={{ width: "100%", height: "60px", padding: "10px", boxSizing: "border-box", borderRadius: "8px", border: "1px solid #e0e0e0", fontSize: "13px", resize: "none", backgroundColor: "#f9f9f9", color: "#333", fontFamily: "inherit" }}
+            />
+          </div>
+
+          <div style={{ display: "flex", gap: "8px" }}>
+            {isSaved ? (
+              <>
+                <button onClick={handleDeletePlace} disabled={isLoadingApi} style={{ flex: 1, padding: "12px", backgroundColor: "#fce8e6", color: "#d93025", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: isLoadingApi ? "not-allowed" : "pointer", opacity: isLoadingApi ? 0.7 : 1 }}>
+                  {isLoadingApi ? "처리중..." : t.delete}
+                </button>
+                <button onClick={handleSavePlace} disabled={isLoadingApi} style={{ flex: 1, padding: "12px", backgroundColor: "#1a73e8", color: "white", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: isLoadingApi ? "not-allowed" : "pointer", boxShadow: "0 1px 2px rgba(60,64,67,0.3)", opacity: isLoadingApi ? 0.7 : 1 }}>
+                  {isLoadingApi ? "처리중..." : t.update}
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => setShowDetails(false)} style={{ flex: 1, padding: "12px", backgroundColor: "#f1f3f4", color: "#3c4043", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: "pointer" }}>
+                  {t.cancel}
+                </button>
+                <button onClick={handleSavePlace} disabled={isLoadingApi} style={{ flex: 1, padding: "12px", backgroundColor: "#1a73e8", color: "white", border: "none", borderRadius: "8px", fontWeight: "bold", fontSize: "14px", cursor: isLoadingApi ? "not-allowed" : "pointer", boxShadow: "0 1px 2px rgba(60,64,67,0.3)", opacity: isLoadingApi ? 0.7 : 1 }}>
+                  {isLoadingApi ? "처리중..." : t.save}
+                </button>
+              </>
             )}
           </div>
         </div>
